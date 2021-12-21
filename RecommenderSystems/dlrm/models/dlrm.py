@@ -43,13 +43,28 @@ class MLP(nn.Module):
     def forward(self, x:flow.Tensor) -> flow.Tensor:
         return self.linear_layers(x)
 
-
+'''
 class Embedding(nn.Embedding):
     def __init__(self, vocab_size, embed_size):
         super(Embedding, self).__init__(vocab_size, embed_size, padding_idx=0)
         for param in self.parameters():
             nn.init.uniform_(param, a=-0.05, b=0.05)
+'''
 
+class Embedding(nn.OneEmbeddingLookup):
+    def __init__(self, vocab_size, embed_size):
+        options = {
+            "name": "my_embedding",
+            # Can't change the embedding_size 128 because the kv store value_length has been set to 128
+            "embedding_size": 128,
+            "dtype": flow.float,
+            "encoder": "invalid",
+            "partitioning": "invalid",
+            "initializer": "invalid",
+            "optimizer": "invalid",
+            "backend": "invalid",
+        }
+        super(Embedding, self).__init__(options)
 
 class ConsistentDLRM(nn.Module):
     def __init__(
@@ -66,7 +81,7 @@ class ConsistentDLRM(nn.Module):
         self.bottom_mlp.to_consistent(flow.env.all_device_placement("cuda"), flow.sbp.broadcast)
 
         self.embedding = Embedding(vocab_size, embedding_vec_size // flow.env.get_world_size())
-        self.embedding.to_consistent(flow.env.all_device_placement("cuda"), flow.sbp.split(1))
+        self.embedding.to_consistent(flow.env.all_device_placement("cuda"), flow.sbp.split(0))
         feature_size = embedding_vec_size * num_sparse_fields + bottom_mlp[-1]
         self.top_mlp = MLP(feature_size, top_mlp)
         self.top_mlp.to_consistent(flow.env.all_device_placement("cuda"), flow.sbp.broadcast)
@@ -76,15 +91,19 @@ class ConsistentDLRM(nn.Module):
         self.sigmoid.to_consistent(flow.env.all_device_placement("cuda"), flow.sbp.broadcast)
 
     def forward(self, dense_fields, sparse_fields) -> flow.Tensor:
-        dense_fields = dense_fields.to_consistent(sbp=flow.sbp.broadcast)
+        dense_fields = dense_fields.to_consistent(sbp=flow.sbp.split(0))
         dense_fields = self.bottom_mlp(dense_fields)
 
-        sparse_fields = sparse_fields.to_consistent(sbp=flow.sbp.broadcast)
+        sparse_fields = sparse_fields.to_consistent(sbp=flow.sbp.split(0))
+        sparse_fields = flow.cast(sparse_fields, flow.int64)
         embedding = self.embedding(sparse_fields)
-        embedding = embedding.to_consistent(sbp=flow.sbp.split(0), grad_sbp=flow.sbp.split(2))
+        print("embedding", embedding.shape, embedding.sbp)
+        #embedding = embedding.to_consistent(sbp=flow.sbp.split(0), grad_sbp=flow.sbp.split(2))
         embedding = embedding.view(-1, embedding.shape[-1] * embedding.shape[-2])
+        print("embedding", embedding.shape, embedding.sbp)
         features = flow.cat([embedding, dense_fields], dim=1)
         features = self.top_mlp(features)
+        print("features", features.shape, features.sbp)
         scores = self.scores(features)
         return self.sigmoid(scores)
 
